@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -438,24 +439,32 @@ ssize_t fscrypt_read(struct fscrypt_state *s,
     size_t   done    = 0;
     int      ret     = 0;
 
-    uint8_t page_iv[16], enc[FSCRYPT_PAGE_SIZE], dec[FSCRYPT_PAGE_SIZE];
+    // Read everything into memory then decrypt all at once.
+    // This might be an issue if the user wanted to read like 10GB of blocks
+    // at once, but I don't want to support that use case.
+    uint64_t start_page_num = offset / FSCRYPT_PAGE_SIZE;
+    uint64_t start_page_off = offset % FSCRYPT_PAGE_SIZE;
+    uint64_t end_page_num = (offset + size) / FSCRYPT_PAGE_SIZE;
+    uint64_t enc_size = (end_page_num - start_page_num + 1) * FSCRYPT_PAGE_SIZE;
+    uint8_t* enc = calloc(enc_size, sizeof(uint8_t));
 
-    while (done < size) {
-        uint64_t img_cur       = (uint64_t)offset + done;
-        uint64_t page_num      = img_cur / FSCRYPT_PAGE_SIZE;
-        uint64_t page_off      = img_cur % FSCRYPT_PAGE_SIZE;
-        /* Image offset of the start of this page (used for IV derivation). */
+    if (enc == nullptr) {
+        ret = -ENOMEM;
+        goto _end;
+    }
+
+    ret = read_exact(s->fd, enc, enc_size, img_to_cont(s, (off_t)(start_page_num * FSCRYPT_PAGE_SIZE)));
+
+    if (ret != 0)
+        goto _end;
+
+    uint8_t page_iv[16], dec[FSCRYPT_PAGE_SIZE];
+
+    for (uint64_t page_num = start_page_num; page_num <= end_page_num; page_num++) {
+        uint64_t page_off = page_num == start_page_num ? start_page_off : 0;
         uint64_t page_img_base = page_num * FSCRYPT_PAGE_SIZE;
+        uint64_t enc_off = (page_num - start_page_num) * FSCRYPT_PAGE_SIZE;
 
-        off_t cont_off = img_to_cont(s, (off_t)page_img_base);
-
-        /* Read one encrypted page; zero-pad if the file is shorter. */
-        ret = read_exact(s->fd, enc, FSCRYPT_PAGE_SIZE, cont_off);
-
-        if (ret != 0)
-            break;
-
-        /* Derive per-page IV and decrypt. */
         derive_page_iv(s->page_iv, page_img_base, page_iv);
 
         if (EVP_DecryptInit_ex(s->decrypt_ctx, nullptr, nullptr, nullptr, page_iv) != 1) {
@@ -465,7 +474,7 @@ ssize_t fscrypt_read(struct fscrypt_state *s,
 
         int n1 = 0, n2 = 0;
 
-        if (EVP_DecryptUpdate(s->decrypt_ctx, dec, &n1, enc, (int)FSCRYPT_PAGE_SIZE) != 1) {
+        if (EVP_DecryptUpdate(s->decrypt_ctx, dec, &n1, enc + enc_off, (int)FSCRYPT_PAGE_SIZE) != 1) {
             ret = -EIO;
             break;
         }
@@ -482,6 +491,9 @@ ssize_t fscrypt_read(struct fscrypt_state *s,
         done += copy;
     }
 
+_end:
+    if (enc != nullptr)
+        free(enc);
     pthread_mutex_unlock(&s->lock);
     return ret ? (ssize_t)ret : (ssize_t)done;
 }
