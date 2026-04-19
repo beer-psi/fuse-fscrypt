@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+
+import argparse
+import contextlib
+import errno
+import secrets
+import select
+import subprocess
+import time
+from pathlib import Path
+
+
+def unmount_images(mountpoint: Path, temp_mount_path: Path, images: list[Path]):
+    for image in images:
+        for mount in (
+            mountpoint / image.stem,
+            temp_mount_path / image.stem,
+        ):
+            subprocess.call(["umount", mount])
+            time.sleep(0.5)
+
+            with contextlib.suppress(FileNotFoundError, OSError):
+                mount.rmdir()
+
+    temp_mount_path.rmdir()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "images",
+        metavar="IMAGE",
+        nargs="+",
+        type=Path,
+        help="Path to base image and any delta images. Delta images will be modified to match parent path.",
+    )
+    parser.add_argument(
+        "mountpoint", metavar="MOUNTPOINT", type=Path, help="Mount location"
+    )
+    parser.add_argument(
+        "--rw", "--read-write", action="store_true", help="Mount read-write"
+    )
+
+    args = parser.parse_args()
+    images: list[Path] = args.images
+    mountpoint: Path = args.mountpoint
+    read_only: bool = not args.rw
+    temp_mount_path = mountpoint / ("fscrypt" + secrets.token_hex(4))
+
+    if mountpoint.is_file():
+        print("mount-option: cannot mount to a file")
+        exit(errno.ENOTDIR)
+
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    temp_mount_path.mkdir(parents=True, exist_ok=True)
+
+    for image in images:
+        exfat_mount_path = temp_mount_path / image.stem
+        image_mountpoint = mountpoint / image.stem
+
+        exfat_mount_path.mkdir(exist_ok=True)
+        image_mountpoint.mkdir(exist_ok=True)
+
+        try:
+            subprocess.check_call(
+                [
+                    "fuse-fscrypt",
+                    "-o",
+                    f"allow_other{',ro' if read_only else ''}",
+                    f"--container={image}",
+                    exfat_mount_path,
+                ]
+            )
+            subprocess.check_call(
+                [
+                    "mount",
+                    "-t",
+                    "exfat",
+                    "-o",
+                    f"loop{',ro' if read_only else ''}",
+                    exfat_mount_path / "image.exfat",
+                    image_mountpoint,
+                ]
+            )
+        except subprocess.CalledProcessError as e:
+            print("mount-option: failed to mount one of the images")
+            unmount_images(mountpoint, temp_mount_path, images)
+            exit(e.returncode)
+
+    print(
+        f"mount-option: Mounted images at {mountpoint}. Waiting for unmount (or Ctrl-C to exit)"
+    )
+
+    f = open("/proc/mounts")
+
+    while True:
+        try:
+            _, __, ___ = select.select([], [], [f])
+        except KeyboardInterrupt:
+            print("mount-option: received ctrl-c, unmounting everything and exiting")
+            unmount_images(mountpoint, temp_mount_path, images)
+            exit(0)
+
+        f.seek(0)
+
+        mounts = f.read()
+        mounted = True
+
+        for image in images:
+            exfat_mount_path = temp_mount_path / image.stem
+            image_mountpoint = mountpoint / image.stem
+
+            mounted = (
+                mounted
+                and str(exfat_mount_path) in mounts
+                and str(image_mountpoint) in mounts
+            )
+
+            if not mounted:
+                break
+
+        if not mounted:
+            print("mount-option: detected an unmount, unmounting everything...")
+            unmount_images(mountpoint, temp_mount_path, images)
+            exit(0)

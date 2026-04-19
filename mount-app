@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+
+# utility script to mount chains of encrypted fscrypt images. requires
+# fuse-fscrypt, ntfs-3g and libvhdi (optionally libguestfs for RW mounting support).
+#
+# usage:
+#     mount-app [--rw] IMAGE [IMAGE ...] MOUNTPOINT
+# delta images (second IMAGE and onwards) are patched to reference the
+# previous image as their parent image. if this behavior is undesirable,
+# make a copy before mounting.
+#
+# each image is mounted individually under mountpoint, so if you provide BASE and DELTA1,
+# then you get MOUNTPOINT/BASE and MOUNTPOINT/DELTA1 (DELTA1's VHD references the parent,
+# so it's basically an updated version)
+#
+# after mounting, waits for the images to be unmounted, then cleans up temporary
+# mounts (created in MOUNTPOINT/fscrypt) before exiting.
+import argparse
+import contextlib
+import errno
+import fcntl
+import itertools
+import secrets
+import select
+import shutil
+import struct
+import subprocess
+import time
+import uuid
+from pathlib import Path
+
+HAS_GUESTMOUNT = shutil.which("guestmount") is not None
+
+
+def unmount_images(
+    mountpoint: Path,
+    temp_mount_path: Path,
+    images: list[Path],
+    *,
+    root_used_vhdimount: bool,
+):
+    for i, image in reversed(list(enumerate(images))):
+        image_mountpoint = temp_mount_path / image.stem
+        ntfs_mountpoint = temp_mount_path / (image.stem + "_ntfs")
+        vhdimount_mountpoint = temp_mount_path / (image.stem + "_vhdimount")
+        final_mountpoint = mountpoint / image.stem
+
+        if i != 0 or not HAS_GUESTMOUNT or root_used_vhdimount:
+            mountpoints = [
+                final_mountpoint,
+                vhdimount_mountpoint,
+                ntfs_mountpoint,
+                image_mountpoint,
+            ]
+        else:
+            mountpoints = [final_mountpoint, ntfs_mountpoint, image_mountpoint]
+
+        for m in mountpoints:
+            subprocess.call(["umount", m])
+            time.sleep(0.5)
+
+            with contextlib.suppress(FileNotFoundError, OSError):
+                m.rmdir()
+
+    temp_mount_path.rmdir()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "images",
+        metavar="IMAGE",
+        nargs="+",
+        type=Path,
+        help="Path to base image and any delta images. Delta images will be modified to match parent path.",
+    )
+    parser.add_argument(
+        "mountpoint", metavar="MOUNTPOINT", type=Path, help="Mount location"
+    )
+    parser.add_argument(
+        "--rw", "--read-write", action="store_true", help="Mount read-write"
+    )
+
+    args = parser.parse_args()
+    images: list[Path] = args.images
+    mountpoint: Path = args.mountpoint
+    read_only: bool = not args.rw
+    temp_mount_path = mountpoint / ("fscrypt" + secrets.token_hex(4))
+
+    if mountpoint.is_file():
+        print("mount-app: cannot mount to a file")
+        exit(errno.ENOTDIR)
+
+    if not read_only and not HAS_GUESTMOUNT:
+        print("mount-app: guestmount is required to mount read-write")
+        exit(errno.ENOENT)
+
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    temp_mount_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for i, image in enumerate(images):
+            # to protect from chance corruptions, images should be readonly if
+            # guestmount is not available and the image is root (since child images
+            # need to be modified anyways to patch the parent path)
+            mount_read_only = i == 0 and (read_only or not HAS_GUESTMOUNT)
+            image_mountpoint = temp_mount_path / image.stem
+
+            image_mountpoint.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(
+                [
+                    "fuse-fscrypt",
+                    "-o",
+                    f"allow_other{',ro' if mount_read_only else ''}",
+                    f"--container={image}",
+                    image_mountpoint,
+                ]
+            )
+
+            ntfs_mountpoint = temp_mount_path / (image.stem + "_ntfs")
+
+            ntfs_mountpoint.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(
+                [
+                    "mount",
+                    "-o",
+                    f"loop,noload{',ro' if mount_read_only else ''}",
+                    "-t",
+                    "ntfs-3g",
+                    temp_mount_path / image.stem / "image.ntfs",
+                    ntfs_mountpoint,
+                ]
+            )
+    except subprocess.CalledProcessError as e:
+        print("mount-app: failed to mount one of the images")
+        unmount_images(
+            mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+        )
+        exit(e.returncode)
+
+    # at this point, we have all images mounted under temp_mount_path / image.stem / "image.ntfs"
+    # mount each image under mountpoint / image.stem
+    # wait a bit for everything to synchronize
+    time.sleep(0.5)
+
+    if HAS_GUESTMOUNT and not read_only:
+        # if guestmount is available, mount the base image with guestmount for RW support
+        first_image = images[0]
+        first_image_ntfs_mountpoint = temp_mount_path / (first_image.stem + "_ntfs")
+        first_image_mountpoint = mountpoint / first_image.stem
+
+        first_image_mountpoint.mkdir(exist_ok=True)
+
+        try:
+            subprocess.check_call(
+                [
+                    "guestmount",
+                    "-o",
+                    "allow_other",
+                    "--add",
+                    first_image_ntfs_mountpoint / "internal_0.vhd",
+                    "--mount",
+                    "/dev/sda1",
+                    first_image_mountpoint,
+                ]
+            )
+        except subprocess.CalledProcessError as e:
+            print("mount-app: failed to mount internal VHD with guestmount")
+            unmount_images(
+                mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+            )
+            exit(e.returncode)
+
+    # Apply the correct parent for differencing VHDs
+    if len(images) > 1:
+        print("mount-app: Patching parent filenames in differencing disks")
+
+        for i, (parent, child) in enumerate(itertools.pairwise(images)):
+            parent_ntfs_mountpoint = temp_mount_path / (parent.stem + "_ntfs")
+            ntfs_mountpoint = temp_mount_path / (child.stem + "_ntfs")
+            parent_vhd = parent_ntfs_mountpoint / f"internal_{i}.vhd"
+            child_vhd = ntfs_mountpoint / f"internal_{i + 1}.vhd"
+
+            if not parent_vhd.exists():
+                print(f"mount-app: parent VHD {parent_vhd} does not exist")
+                unmount_images(
+                    mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+                )
+                exit(errno.ENOENT)
+
+            if not child_vhd.exists():
+                print(f"mount-app: child VHD {child_vhd} does not exist")
+                unmount_images(
+                    mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+                )
+                exit(errno.ENOENT)
+
+            with parent_vhd.open("rb") as f:
+                header = f.read(84)
+
+                if header[:8] != b"conectix":
+                    print(f"{parent_vhd} is not a valid VHD file")
+                    unmount_images(
+                        mountpoint,
+                        temp_mount_path,
+                        images,
+                        root_used_vhdimount=read_only,
+                    )
+                    exit(errno.EINVAL)
+
+                parent_modification_time = int.from_bytes(
+                    header[24:28], "big", signed=True
+                )
+                parent_uuid = uuid.UUID(bytes=header[68:84])
+
+            with child_vhd.open("r+b") as f:
+                header = f.read(24)
+
+                if header[:8] != b"conectix":
+                    print(f"{child_vhd} is not a valid VHD file")
+                    unmount_images(
+                        mountpoint,
+                        temp_mount_path,
+                        images,
+                        root_used_vhdimount=read_only,
+                    )
+                    exit(errno.EINVAL)
+
+                next_offset = int.from_bytes(header[16:24], "big", signed=True)
+
+                if next_offset < 0:
+                    print(f"{child_vhd} is not a dynamic/differencing VHD")
+                    unmount_images(
+                        mountpoint,
+                        temp_mount_path,
+                        images,
+                        root_used_vhdimount=read_only,
+                    )
+                    exit(errno.EINVAL)
+
+                f.seek(next_offset)
+                header = f.read(576)
+
+                if header[:8] != b"cxsparse":
+                    print(f"{child_vhd} has invalid dynamic disk header")
+                    unmount_images(
+                        mountpoint,
+                        temp_mount_path,
+                        images,
+                        root_used_vhdimount=read_only,
+                    )
+                    exit(errno.EINVAL)
+
+                child_parent_uuid = uuid.UUID(bytes=header[40:56])
+                child_parent_modification_time = int.from_bytes(
+                    header[56:60], "big", signed=True
+                )
+
+                if (
+                    parent_uuid != child_parent_uuid
+                    or parent_modification_time != child_parent_modification_time
+                ):
+                    print(
+                        f"{parent_vhd} is not the parent of {child_vhd} ({parent_uuid=} {parent_modification_time=} {child_parent_uuid=} {child_parent_modification_time=})"
+                    )
+                    unmount_images(
+                        mountpoint,
+                        temp_mount_path,
+                        images,
+                        root_used_vhdimount=read_only,
+                    )
+                    exit(errno.EINVAL)
+
+                parent_utf_16_be = str(
+                    parent_vhd.relative_to(child_vhd.parent, walk_up=True)
+                ).encode("utf-16-be")
+
+                f.seek(next_offset + 64)
+                f.write(parent_utf_16_be)
+                f.write(b"\x00" * (512 - len(parent_utf_16_be)))
+
+    # finally, mount all VHDs
+    for i, image in enumerate(images):
+        # if guestmount is available, the root image was already mounted through guestmount
+        if i == 0 and HAS_GUESTMOUNT and not read_only:
+            continue
+
+        image_index = i
+        ntfs_mountpoint = temp_mount_path / (image.stem + "_ntfs")
+        vhdimount_mountpoint = temp_mount_path / (image.stem + "_vhdimount")
+
+        vhdimount_mountpoint.mkdir(exist_ok=True)
+
+        try:
+            subprocess.check_call(
+                [
+                    "vhdimount",
+                    "-X",
+                    "allow_other",
+                    ntfs_mountpoint / f"internal_{image_index}.vhd",
+                    vhdimount_mountpoint,
+                ]
+            )
+        except subprocess.CalledProcessError as e:
+            print("mount-vhd: failed to mount child image using vhdimount")
+            unmount_images(
+                mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+            )
+            exit(e.returncode)
+
+        # pick up the last vhdi, since that has all the differencing stuff
+        *_, vhdi_to_use = vhdimount_mountpoint.iterdir()
+
+        # determine the offset of the NTFS image to pass to ntfs-3g. the VHD should use a MBR
+        with vhdi_to_use.open("rb") as f:
+            try:
+                blocksize = struct.unpack(
+                    "i", fcntl.ioctl(f.fileno(), 4608 | 104, struct.pack("i", -1))
+                )[0]
+            except OSError:
+                blocksize = 512
+
+            # skip the boot code
+            f.seek(446)
+
+            partition1 = f.read(16)
+            first_lba = int.from_bytes(partition1[8:12], "little", signed=False)
+
+            f.seek(first_lba * blocksize)
+
+            if f.read(11) != b"\xeb\x52\x90NTFS    ":
+                print("mount-app: child VHD has invalid NTFS partition")
+                unmount_images(
+                    mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+                )
+                exit(errno.EINVAL)
+
+        (mountpoint / image.stem).mkdir(exist_ok=True)
+
+        try:
+            subprocess.check_call(
+                [
+                    "mount",
+                    "-t",
+                    "ntfs-3g",
+                    "-o",
+                    f"loop,offset={first_lba * blocksize},ro,noload",
+                    vhdi_to_use,
+                    mountpoint / image.stem,
+                ]
+            )
+        except subprocess.CalledProcessError as e:
+            print("mount-vhd: failed to mount child VHD as NTFS")
+            unmount_images(
+                mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+            )
+            exit(e.returncode)
+
+    # everything is now mounted. watch for changes in /proc/mounts. if any mountpoint
+    # in the chain is unmounted, unmount everything
+    print(
+        f"mount-app: Mounted images at {mountpoint}. Waiting for unmount (or Ctrl-C to exit)"
+    )
+
+    f = open("/proc/mounts")
+
+    while True:
+        try:
+            _, __, ___ = select.select([], [], [f])
+        except KeyboardInterrupt:
+            print("mount-app: received ctrl-c, unmounting everything and exiting")
+            unmount_images(
+                mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+            )
+            exit(0)
+
+        f.seek(0)
+
+        mounts = f.read()
+        mounted = True
+
+        for i, image in enumerate(images):
+            image_mountpoint = temp_mount_path / image.stem
+            ntfs_mountpoint = temp_mount_path / (image.stem + "_ntfs")
+            vhdimount_mountpoint = temp_mount_path / (image.stem + "_vhdimount")
+            final_mountpoint = mountpoint / image.stem
+
+            mounted = (
+                mounted
+                and str(image_mountpoint) in mounts
+                and str(ntfs_mountpoint) in mounts
+                and str(final_mountpoint) in mounts
+                and ((i == 0 and HAS_GUESTMOUNT) or str(vhdimount_mountpoint) in mounts)
+            )
+
+            if not mounted:
+                break
+
+        # an image in the chain has been unmounted, unmounting everything
+        if not mounted:
+            print("mount-app: Detected an unmount, unmounting everything...")
+            unmount_images(
+                mountpoint, temp_mount_path, images, root_used_vhdimount=read_only
+            )
+            exit(0)

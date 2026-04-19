@@ -1,0 +1,6 @@
+.cache
+build
+build-*
+*.exfat
+*.opt
+*.pem
