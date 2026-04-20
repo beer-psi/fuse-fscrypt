@@ -20,6 +20,7 @@ import contextlib
 import errno
 import fcntl
 import itertools
+import os
 import secrets
 import select
 import shutil
@@ -197,9 +198,10 @@ if __name__ == "__main__":
                 exit(errno.ENOENT)
 
             with parent_vhd.open("rb") as f:
-                header = f.read(84)
+                f.seek(-512, os.SEEK_END)
+                footer = f.read(512)
 
-                if header[:8] != b"conectix":
+                if len(footer) < 512 or footer[:8] != b"conectix":
                     print(f"{parent_vhd} is not a valid VHD file")
                     unmount_images(
                         mountpoint,
@@ -210,14 +212,15 @@ if __name__ == "__main__":
                     exit(errno.EINVAL)
 
                 parent_modification_time = int.from_bytes(
-                    header[24:28], "big", signed=True
+                    footer[24:28], "big", signed=True
                 )
-                parent_uuid = uuid.UUID(bytes=header[68:84])
+                parent_uuid = uuid.UUID(bytes=footer[68:84])
 
             with child_vhd.open("r+b") as f:
-                header = f.read(24)
+                f.seek(-512, os.SEEK_END)
+                footer = f.read(512)
 
-                if header[:8] != b"conectix":
+                if len(footer) < 512 or footer[:8] != b"conectix":
                     print(f"{child_vhd} is not a valid VHD file")
                     unmount_images(
                         mountpoint,
@@ -227,7 +230,7 @@ if __name__ == "__main__":
                     )
                     exit(errno.EINVAL)
 
-                next_offset = int.from_bytes(header[16:24], "big", signed=True)
+                next_offset = int.from_bytes(footer[16:24], "big", signed=True)
 
                 if next_offset < 0:
                     print(f"{child_vhd} is not a dynamic/differencing VHD")
@@ -240,9 +243,9 @@ if __name__ == "__main__":
                     exit(errno.EINVAL)
 
                 f.seek(next_offset)
-                header = f.read(576)
+                dynamic_header = f.read(576)
 
-                if header[:8] != b"cxsparse":
+                if dynamic_header[:8] != b"cxsparse":
                     print(f"{child_vhd} has invalid dynamic disk header")
                     unmount_images(
                         mountpoint,
@@ -252,9 +255,9 @@ if __name__ == "__main__":
                     )
                     exit(errno.EINVAL)
 
-                child_parent_uuid = uuid.UUID(bytes=header[40:56])
+                child_parent_uuid = uuid.UUID(bytes=dynamic_header[40:56])
                 child_parent_modification_time = int.from_bytes(
-                    header[56:60], "big", signed=True
+                    dynamic_header[56:60], "big", signed=True
                 )
 
                 if (
