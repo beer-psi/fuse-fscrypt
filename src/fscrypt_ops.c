@@ -294,9 +294,17 @@ int fscrypt_open_container(const char    *path,
         } else {
             const struct GameKeyEntry* keys = nullptr;
 
+            if (s->bootid.type == APP_TYPE_SYSTEM) {
+                char id[4] = { 0 };
+                memcpy(id, s->bootid.hw_family, sizeof(s->bootid.hw_family));
+                find_game_keys(id, &keys);
+            } else {
+                find_game_keys(s->bootid.id, &keys);
+            }
+
             // It is not super disastrous if we don't know the IV, since we can usually brute force
             // it using the trick below. Missing a key is a huge issue though.
-            if (!find_game_keys(s->bootid.id, &keys) && s->file_key_len == 0) {
+            if (keys == nullptr && s->file_key_len == 0) {
                 fprintf(
                     stderr, "fscrypt: key was not provided and %.*s is not a known ID.\n",
                     (int)sizeof(s->bootid.id), s->bootid.id
