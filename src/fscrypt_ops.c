@@ -1,5 +1,6 @@
 #include "fscrypt_ops.h"
 #include "crypto.h"
+#include "src/cache.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -135,6 +136,7 @@ static int update_block_crc32(struct fscrypt_state *s, uint64_t block_num)
 int fscrypt_open_container(const char    *path,
                            const uint8_t *key, size_t key_len,
                            const uint8_t *iv,  size_t iv_len,
+                           int no_cache,
                            struct fscrypt_state **out)
 {
     if (key_len != 0 && key_len != 16 && key_len != 24 && key_len != 32)
@@ -288,8 +290,8 @@ int fscrypt_open_container(const char    *path,
         }
     }
 
-    memcpy(s->page_key, key, key_len);
-    s->page_key_len = key_len;
+    memcpy(s->file_key, key, key_len);
+    s->file_key_len = key_len;
 
     if (iv_len == 0 || s->bootid.derive_iv) {
         // If IV is not given or the image uses a "derived" IV, try to guess the IV
@@ -312,13 +314,13 @@ int fscrypt_open_container(const char    *path,
             goto err_close;
         }
 
-        if (aes_cbc_decrypt(s->page_key, s->page_key_len, expected_header, encrypted_header, 16, calculated_iv) != 0) {
+        if (aes_cbc_decrypt(s->file_key, s->file_key_len, expected_header, encrypted_header, 16, calculated_iv) != 0) {
             fprintf(stderr, "fscrypt: failed to derive IV (could not decrypt data with filesystem header as IV)\n");
             ret = -EIO;
             goto err_close;
         }
 
-        if (aes_cbc_decrypt(s->page_key, s->page_key_len, calculated_iv, encrypted_header, 16, decrypted_header) != 0) {
+        if (aes_cbc_decrypt(s->file_key, s->file_key_len, calculated_iv, encrypted_header, 16, decrypted_header) != 0) {
             fprintf(stderr, "fscrypt: failed to derive IV (could not decrypt data with derived IV)\n");
             ret = -EIO;
             goto err_close;
@@ -330,17 +332,17 @@ int fscrypt_open_container(const char    *path,
             goto err_close;
         }
 
-        memcpy(s->page_iv, calculated_iv, 16);
+        memcpy(s->file_iv, calculated_iv, 16);
     } else {
         // iv_len is either 0 or 16, since we already validated input
         // params, and our embedded keys only either set an IV or not
-        memcpy(s->page_iv, iv, iv_len);
+        memcpy(s->file_iv, iv, iv_len);
     }
 
-    const EVP_CIPHER* cipher = select_aes_cbc(s->page_key_len);
+    const EVP_CIPHER* cipher = select_aes_cbc(s->file_key_len);
 
     if (cipher == nullptr) {
-        fprintf(stderr, "fscrypt: unsupported AES key length %zu\n", s->page_key_len);
+        fprintf(stderr, "fscrypt: unsupported AES key length %zu\n", s->file_key_len);
         ret = -EINVAL;
         goto err_close;
     }
@@ -349,7 +351,7 @@ int fscrypt_open_container(const char    *path,
     // every page read.
     s->encrypt_ctx = EVP_CIPHER_CTX_new();
 
-    if (EVP_EncryptInit_ex(s->encrypt_ctx, cipher, nullptr, s->page_key, s->page_iv) != 1) {
+    if (EVP_EncryptInit_ex(s->encrypt_ctx, cipher, nullptr, s->file_key, s->file_iv) != 1) {
         fprintf(stderr, "fscrypt: failed to initialize encryption context\n");
         ret = -EIO;
         goto err_close;
@@ -359,7 +361,7 @@ int fscrypt_open_container(const char    *path,
 
     s->decrypt_ctx = EVP_CIPHER_CTX_new();
 
-    if (EVP_DecryptInit_ex(s->decrypt_ctx, cipher, nullptr, s->page_key, s->page_iv) != 1) {
+    if (EVP_DecryptInit_ex(s->decrypt_ctx, cipher, nullptr, s->file_key, s->file_iv) != 1) {
         fprintf(stderr, "fscrypt: failed to initialize decryption context\n");
         ret = -EIO;
         goto err_close;
@@ -381,6 +383,10 @@ int fscrypt_open_container(const char    *path,
         .tm_zone = "Asia/Tokyo",
     };
     s->image_timestamp = mktime(&bootid_tm);
+
+    // Don't check if the page cache actually exists, it is fine if it doesn't
+    if (!no_cache)
+        s->page_cache = page_cache_create();
 
     pthread_mutex_init(&s->lock, NULL);
 
@@ -439,49 +445,46 @@ ssize_t fscrypt_read(struct fscrypt_state *s,
     size_t   done    = 0;
     int      ret     = 0;
 
-    // Read everything into memory then decrypt all at once.
-    // This might be an issue if the user wanted to read like 10GB of blocks
-    // at once, but I don't want to support that use case.
-    uint64_t start_page_num = offset / FSCRYPT_PAGE_SIZE;
-    uint64_t start_page_off = offset % FSCRYPT_PAGE_SIZE;
-    uint64_t end_page_num = (offset + size) / FSCRYPT_PAGE_SIZE;
-    uint64_t enc_size = (end_page_num - start_page_num + 1) * FSCRYPT_PAGE_SIZE;
-    uint8_t* enc = calloc(enc_size, sizeof(uint8_t));
+    uint8_t page_iv[16], enc[FSCRYPT_PAGE_SIZE], dec[FSCRYPT_PAGE_SIZE];
 
-    if (enc == nullptr) {
-        ret = -ENOMEM;
-        goto _end;
-    }
-
-    ret = read_exact(s->fd, enc, enc_size, img_to_cont(s, (off_t)(start_page_num * FSCRYPT_PAGE_SIZE)));
-
-    if (ret != 0)
-        goto _end;
-
-    uint8_t page_iv[16], dec[FSCRYPT_PAGE_SIZE];
-
-    for (uint64_t page_num = start_page_num; page_num <= end_page_num; page_num++) {
-        uint64_t page_off = page_num == start_page_num ? start_page_off : 0;
+    while (done < size) {
+        uint64_t img_cur       = (uint64_t)offset + done;
+        uint64_t page_num      = img_cur / FSCRYPT_PAGE_SIZE;
+        uint64_t page_off      = img_cur % FSCRYPT_PAGE_SIZE;
+        /* Image offset of the start of this page (used for IV derivation and caching). */
         uint64_t page_img_base = page_num * FSCRYPT_PAGE_SIZE;
-        uint64_t enc_off = (page_num - start_page_num) * FSCRYPT_PAGE_SIZE;
 
-        derive_page_iv(s->page_iv, page_img_base, page_iv);
+        if (s->page_cache == nullptr || page_cache_get(s->page_cache, page_img_base, dec) < 0) {
+            off_t cont_off = img_to_cont(s, (off_t)page_img_base);
 
-        if (EVP_DecryptInit_ex(s->decrypt_ctx, nullptr, nullptr, nullptr, page_iv) != 1) {
-            ret = -EIO;
-            break;
-        }
+            /* Read one encrypted page; zero-pad if the file is shorter. */
+            ret = read_exact(s->fd, enc, FSCRYPT_PAGE_SIZE, cont_off);
 
-        int n1 = 0, n2 = 0;
+            if (ret != 0)
+                break;
 
-        if (EVP_DecryptUpdate(s->decrypt_ctx, dec, &n1, enc + enc_off, (int)FSCRYPT_PAGE_SIZE) != 1) {
-            ret = -EIO;
-            break;
-        }
+            /* Derive per-page IV and decrypt. */
+            derive_page_iv(s->file_iv, page_img_base, page_iv);
 
-        if (EVP_DecryptFinal_ex(s->decrypt_ctx, dec + n1, &n2) != 1) {
-            ret = -EIO;
-            break;
+            if (EVP_DecryptInit_ex(s->decrypt_ctx, nullptr, nullptr, nullptr, page_iv) != 1) {
+                ret = -EIO;
+                break;
+            }
+
+            int n1 = 0, n2 = 0;
+
+            if (EVP_DecryptUpdate(s->decrypt_ctx, dec, &n1, enc, (int)FSCRYPT_PAGE_SIZE) != 1) {
+                ret = -EIO;
+                break;
+            }
+
+            if (EVP_DecryptFinal_ex(s->decrypt_ctx, dec + n1, &n2) != 1) {
+                ret = -EIO;
+                break;
+            }
+
+            if (s->page_cache != nullptr)
+                page_cache_set(s->page_cache, page_img_base, dec);
         }
 
         size_t copy = FSCRYPT_PAGE_SIZE - (size_t)page_off;
@@ -491,9 +494,6 @@ ssize_t fscrypt_read(struct fscrypt_state *s,
         done += copy;
     }
 
-_end:
-    if (enc != nullptr)
-        free(enc);
     pthread_mutex_unlock(&s->lock);
     return ret ? (ssize_t)ret : (ssize_t)done;
 }
@@ -532,8 +532,13 @@ ssize_t fscrypt_write(struct fscrypt_state *s,
 
         /* Number of bytes from `buf` that go into this page. */
         size_t copy = FSCRYPT_PAGE_SIZE - (size_t)page_off;
+
         if (copy > size - done)
             copy = size - done;
+
+        /** Evict the page that's about to be written from cache. */
+        if (s->page_cache != nullptr)
+            page_cache_evict(s->page_cache, page_img_base);
 
         /*
          * For a partial-page write we must first read and decrypt the
@@ -549,7 +554,7 @@ ssize_t fscrypt_write(struct fscrypt_state *s,
             int rd = read_exact(s->fd, enc_old, FSCRYPT_PAGE_SIZE, cont_off);
             if (rd != 0) { ret = rd; break; }
 
-            derive_page_iv(s->page_iv, page_img_base, page_iv);
+            derive_page_iv(s->file_iv, page_img_base, page_iv);
 
             int n1 = 0, n2 = 0;
 
@@ -570,7 +575,7 @@ ssize_t fscrypt_write(struct fscrypt_state *s,
         memcpy(dec + page_off, in_ptr + done, copy);
 
         /* Encrypt the modified page. */
-        derive_page_iv(s->page_iv, page_img_base, page_iv);
+        derive_page_iv(s->file_iv, page_img_base, page_iv);
 
         if (EVP_EncryptInit_ex(s->encrypt_ctx, nullptr, nullptr, nullptr, page_iv) != 1) {
             ret = -EIO;
@@ -590,6 +595,7 @@ ssize_t fscrypt_write(struct fscrypt_state *s,
         }
 
         ssize_t n = pwrite(s->fd, enc_new, FSCRYPT_PAGE_SIZE, cont_off);
+
         if (n != (ssize_t)FSCRYPT_PAGE_SIZE) {
             ret = (n < 0) ? -errno : -EIO;
             break;

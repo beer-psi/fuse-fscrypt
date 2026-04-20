@@ -21,6 +21,7 @@ struct cli_options {
     const char *key_hex;
     const char *iv_hex;
     int         show_help;
+    int         no_cache;
 };
 
 static struct cli_options cli_opts = { 0 };
@@ -37,6 +38,7 @@ static const struct fuse_opt option_spec[] = {
     OPTION("-i %s",          iv_hex),
     OPTION("-h",             show_help),
     OPTION("--help",         show_help),
+    OPTION("--no-cache",     no_cache),
     FUSE_OPT_END
 };
 
@@ -206,6 +208,8 @@ static void print_usage(const char *progname)
         "  -c PATH, --container=PATH   path to the fscrypt container file\n"
         "  -k HEX,  --key=HEX          container's AES key\n"
         "  -i HEX,  --iv=HEX           container'S AES initialization vector\n"
+        "  --no-cache                  do not cache recently accessed pages\n"
+        "  -h, --help                  show this help message\n"
         "\n",
         progname);
 }
@@ -268,6 +272,7 @@ int main(int argc, char **argv)
     int ret = fscrypt_open_container(cli_opts.container,
                                      key, key_len,
                                      iv,  iv_len,
+                                     cli_opts.no_cache,
                                      &state);
     if (ret != 0) {
         fprintf(stderr, "error: cannot open container '%s': %s\n",

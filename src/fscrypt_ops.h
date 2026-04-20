@@ -8,6 +8,7 @@
 
 #include <openssl/evp.h>
 
+#include "cache.h"
 #include "fscrypt.h"
 
 /** Size of the encrypted BootID area at the start of the container. */
@@ -39,8 +40,6 @@
  * the CRC32 entry of the first block.
  */
 #define FSCRYPT_CRC32_SKIP      516U
-
-#define FSCRYPT_PAGE_SIZE       4096U
 
 extern const uint8_t FSCRYPT_BOOT_KEY[16];
 extern const uint8_t FSCRYPT_BOOT_IV[16];
@@ -76,17 +75,20 @@ struct fscrypt_state {
     bool headers_dirty;
 
     /** AES key used for page encryption (16, 24, or 32 bytes). */
-    uint8_t page_key[32];
-    size_t  page_key_len;
+    uint8_t file_key[32];
+    size_t  file_key_len;
 
     /** Base IV from which per-page IVs are derived. Always 16 bytes. */
-    uint8_t page_iv[16];
+    uint8_t file_iv[16];
 
     /** Cipher context for encryption operations. */
     EVP_CIPHER_CTX* encrypt_ctx;
 
     /** Cipher context for decryption operations. */
     EVP_CIPHER_CTX* decrypt_ctx;
+
+    /** LRU cache for recently decrypted pages. */
+    struct PageCache* page_cache;
 
     /** Protects all mutable fields for multi-threaded FUSE access. */
     pthread_mutex_t lock;
@@ -102,6 +104,7 @@ struct fscrypt_state {
  * @key_len  : 16, 24, or 32
  * @iv       : base IV for per-page IV derivation (exactly 16 bytes)
  * @iv_len   : must be 16
+ * @no_cache : do not cache recently accessed pages
  * @out      : on success, set to a heap-allocated fscrypt_state
  *
  * Returns 0 on success, negative errno on failure.
@@ -113,6 +116,7 @@ struct fscrypt_state {
 int fscrypt_open_container(const char   *path,
                            const uint8_t *key, size_t key_len,
                            const uint8_t *iv,  size_t iv_len,
+                           int no_cache,
                            struct fscrypt_state **out);
 
 /**

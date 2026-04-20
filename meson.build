@@ -10,6 +10,7 @@ executable(
         'src/main.c',
         'src/crypto.c',
         'src/keys.c',
+        'src/cache.c',
         'src/fscrypt_ops.c',
     ],
     dependencies: [fuse3_dep, openssl_dep, zlib_dep],
