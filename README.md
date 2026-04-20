@@ -84,6 +84,9 @@ Requires `fuse-fscrypt`, [`ntfs-3g`] and [`libvhdi`] installed in PATH.
 mount-app BASE DELTA1 DELTA2 /mnt
 ```
 
+> [!WARNING]
+> DELTA1 and DELTA2 will be directly modified to refer to the correct parent VHD. Make a backup!
+
 This creates `/mnt/BASE` containing the contents of the base image, `/mnt/DELTA1`
 containing the contents of BASE + DELTA1, and `/mnt/DELTA2` containing the contents
 of BASE + DELTA1 + DELTA2
