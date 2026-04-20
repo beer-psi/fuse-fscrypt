@@ -79,7 +79,7 @@ if __name__ == "__main__":
                     "exfat",
                     "-o",
                     f"loop{',ro' if read_only else ''}",
-                    exfat_mount_path / "image.exfat",
+                    exfat_mount_path / "image",
                     image_mountpoint,
                 ]
             )

@@ -101,6 +101,11 @@ due to [lack of] [support] by `libvhdi`.
 
 ### mount-option
 
+> [!WARNING]
+> Use `mount-app` instead for APM3 options, since they actually contain an NTFS image.
+> You will have to invoke `mount-app` for each individual option, since they're technically
+> not deltas.
+
 Mount option `.opt` containers into a specified mount directory.
 Requires `fuse-fscrypt` and [`exfatprogs`] installed in PATH.
 

@@ -129,7 +129,7 @@ if __name__ == "__main__":
                     f"loop,noload{',ro' if mount_read_only else ''}",
                     "-t",
                     "ntfs-3g",
-                    temp_mount_path / image.stem / "image.ntfs",
+                    temp_mount_path / image.stem / "image",
                     ntfs_mountpoint,
                 ]
             )
@@ -140,7 +140,7 @@ if __name__ == "__main__":
         )
         exit(e.returncode)
 
-    # at this point, we have all images mounted under temp_mount_path / image.stem / "image.ntfs"
+    # at this point, we have all images mounted under temp_mount_path / image.stem / "image"
     # mount each image under mountpoint / image.stem
     # wait a bit for everything to synchronize
     time.sleep(0.5)

@@ -15,6 +15,8 @@
 #include <openssl/evp.h>
 #include <zlib.h>
 
+#define IS_APM3(id) ((id)[0] == 'S' && (id)[1] == 'D' && (id)[2] == 'E' && (id)[3] == 'M')
+
 const uint8_t FSCRYPT_BOOT_KEY[16] = {
     0x09, 0xca, 0x5e, 0xfd, 0x30, 0xc9, 0xaa, 0xef,
     0x38, 0x04, 0xd0, 0xa7, 0xe3, 0xfa, 0x71, 0x20
@@ -220,48 +222,81 @@ int fscrypt_open_container(const char    *path,
         goto err_close;
     }
 
-    /* Determine the filename of the image file. */
-    switch (s->bootid.type) {
-        case APP_TYPE_SYSTEM:
-            /* fallthrough */
-        case APP_TYPE_APP:
-            s->image_filename = "image.ntfs";
-            break;
-        case APP_TYPE_OPTION:
-            s->image_filename = "image.exfat";
-            break;
-        default:
-            fprintf(stderr, "fscrypt: unknown app type %d", s->bootid.type);
-            ret = -EINVAL;
-            goto err_close;
+    // Too hard to actually determine the right format, APM3 nonsense.
+    s->image_filename = "image";
+
+    bool iv_known = false;
+
+    if (key_len != 0) {
+        memcpy(s->file_key, key, key_len);
+        s->file_key_len = key_len;
+    }
+
+    if (iv_len != 0) {
+        memcpy(s->file_iv, iv, iv_len);
+        iv_known = true;
     }
 
     // If key or IV is not provided, perform a lookup from the EMBEDDED_GAME_KEYS
     // table and fill in anything still missing
-    if (key_len == 0 || iv_len == 0) {
-        const uint8_t* known_key = nullptr;
-        size_t known_key_len = 0;
-        const uint8_t* known_iv = nullptr;
-
-        // TODO: special breed of apps known as the APM3 option. These are NTFS images.
-        // APM3 keys are derived by
-        // - decrypting a fixed seed with a fixed key/iv
-        // - take the first 16 bytes of the decrypted seed as the key, then the next
-        // 16 bytes of the decrypted seed as the IV, use that to encrypt 32 bytes of
-        // the decrypted seed starting from offset 64
-        // - take the first 16 bytes of this encryption result as the key, take the
-        // next 16 bytes of this encryption result as the IV, apply XOR on both of
-        // them with the game ID, use that as the actual key/iv
+    if (s->file_key_len == 0 || !iv_known) {
         if (s->bootid.type == APP_TYPE_OPTION) {
-            known_key = OPTION_KEY;
-            known_key_len = sizeof(OPTION_KEY);
-            known_iv = OPTION_IV;
+            if (IS_APM3(s->bootid.id)) {
+                fprintf(stderr, "fuse-fscrypt: Key or IV was not defined, using default option key/IV\n");
+
+                if (s->file_key_len == 0) {
+                    memcpy(s->file_key, OPTION_KEY, sizeof(OPTION_KEY));
+                    s->file_key_len = sizeof(OPTION_KEY);
+                }
+
+                if (!iv_known) {
+                    memcpy(s->file_iv, OPTION_IV, sizeof(OPTION_IV));
+                    iv_known = true;
+                }
+            } else {
+                uint8_t derived_apm3_key[16], derived_apm3_iv[16], encrypted_header[16], decrypted_header[16];
+                ret = read_exact(s->fd, encrypted_header, sizeof(encrypted_header), s->bootid.header_block_count * s->bootid.block_size);
+
+                if (ret != 0) {
+                    goto err_close;
+                }
+
+                if (apm3_derive_key(s->bootid.id, derived_apm3_key, derived_apm3_iv)
+                    && aes_cbc_decrypt(
+                        derived_apm3_key, sizeof(derived_apm3_key),
+                        derived_apm3_iv,
+                        encrypted_header, sizeof(encrypted_header),
+                        decrypted_header
+                    ) == 0
+                    && memcmp(decrypted_header, NTFS_HEADER, 8) == 0)
+                {
+                    fprintf(stderr, "fuse-fscrypt: Key or IV was not defined, using APM3 derived key/IV\n");
+
+                    memcpy(s->file_key, derived_apm3_key, sizeof(derived_apm3_key));
+                    s->file_key_len = sizeof(derived_apm3_key);
+
+                    memcpy(s->file_iv, derived_apm3_iv, sizeof(derived_apm3_iv));
+                    iv_known = true;
+                } else {
+                    fprintf(stderr, "fuse-fscrypt: Key or IV was not defined, using default option key/IV\n");
+
+                    if (s->file_key_len == 0) {
+                        memcpy(s->file_key, OPTION_KEY, sizeof(OPTION_KEY));
+                        s->file_key_len = sizeof(OPTION_KEY);
+                    }
+
+                    if (!iv_known) {
+                        memcpy(s->file_iv, OPTION_IV, sizeof(OPTION_IV));
+                        iv_known = true;
+                    }
+                }
+            }
         } else {
             const struct GameKeyEntry* keys = nullptr;
 
             // It is not super disastrous if we don't know the IV, since we can usually brute force
             // it using the trick below. Missing a key is a huge issue though.
-            if (!find_game_keys(s->bootid.id, &keys) && key_len == 0) {
+            if (!find_game_keys(s->bootid.id, &keys) && s->file_key_len == 0) {
                 fprintf(
                     stderr, "fscrypt: key was not provided and %.*s is not a known ID.\n",
                     (int)sizeof(s->bootid.id), s->bootid.id
@@ -270,33 +305,26 @@ int fscrypt_open_container(const char    *path,
                 goto err_close;
             }
 
+            fprintf(stderr, "fuse-fscrypt: Key or IV was not defined, using known key/IV for %.*s\n", (int)sizeof(s->bootid.id), s->bootid.id);
+
             if (keys != nullptr) {
-                known_key = keys->key;
-                known_key_len = sizeof(keys->key);
-                known_iv = keys->iv;
+                if (s->file_key_len == 0) {
+                    memcpy(s->file_key, keys->key, sizeof(keys->key));
+                    s->file_key_len = sizeof(keys->key);
+                }
+
+                if (!iv_known) {
+                    memcpy(s->file_iv, keys->iv, sizeof(keys->iv));
+                    iv_known = true;
+                }
             }
-        }
-
-        if (key_len == 0) {
-            // guaranteed that we have a game key since game key lookup fails
-            // if key_len == 0
-            key = known_key;
-            key_len = known_key_len;
-        }
-
-        if (iv_len == 0 && known_iv != nullptr) {
-            iv = known_iv;
-            iv_len = 16;
         }
     }
 
-    memcpy(s->file_key, key, key_len);
-    s->file_key_len = key_len;
-
-    if (iv_len == 0 || s->bootid.derive_iv) {
-        // If IV is not given or the image uses a "derived" IV, try to guess the IV
-        // This is basically done by decrypting the first 16 bytes of the image with
-        // the exFAT/NTFS header and see if it makes sense.
+    // If IV is still unknown of the image uses a "derived" IV, try to guess the IV
+    // This is basically done by decrypting the first 16 bytes of the image with
+    // the exFAT/NTFS header and see if it makes sense.
+    if (!iv_known || s->bootid.derive_iv) {
         const uint8_t* expected_header = nullptr;
         uint8_t encrypted_header[16];
         uint8_t decrypted_header[16];
@@ -333,10 +361,6 @@ int fscrypt_open_container(const char    *path,
         }
 
         memcpy(s->file_iv, calculated_iv, 16);
-    } else {
-        // iv_len is either 0 or 16, since we already validated input
-        // params, and our embedded keys only either set an IV or not
-        memcpy(s->file_iv, iv, iv_len);
     }
 
     const EVP_CIPHER* cipher = select_aes_cbc(s->file_key_len);

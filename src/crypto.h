@@ -63,3 +63,4 @@ void derive_page_iv(const uint8_t base_iv[16], uint64_t offset,
                     uint8_t out_iv[16]);
 
 bool find_game_keys(const char id[4], const struct GameKeyEntry **out);
+bool apm3_derive_key(const char id[4], uint8_t key[16], uint8_t iv[16]);
