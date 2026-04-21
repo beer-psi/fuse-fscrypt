@@ -1,7 +1,10 @@
-#define FUSE_USE_VERSION 31
-
+#if FUSE_USE_VERSION >= 30
 #include <fuse3/fuse.h>
 #include <fuse3/fuse_opt.h>
+#else
+#include <fuse/fuse.h>
+#include <fuse/fuse_opt.h>
+#endif
 
 #include <errno.h> // IWYU pragma: keep
 #include <stddef.h>
@@ -13,6 +16,11 @@
 #include <time.h>
 
 #include "fscrypt_ops.h"
+
+#ifdef FUSE_WINFSP_FUSE_H_INCLUDED
+#   undef stat
+#   define stat fuse_stat
+#endif
 
 #define IMAGE_FILE_HANDLE 1
 
@@ -71,9 +79,16 @@ static inline struct fscrypt_state *get_state(void)
     return (struct fscrypt_state *)fuse_get_context()->private_data;
 }
 
-static int fscrypt_fuse_getattr(const char *path, struct stat *st,
+static int fscrypt_fuse_getattr(const char *path,
+#if FUSE_USE_VERSION >= 30
+                                struct stat *st,
                                 struct fuse_file_info *fi)
 {
+#else
+                                struct stat *st)
+{
+    const struct fuse_file_info* fi = nullptr;
+#endif
     memset(st, 0, sizeof *st);
 
     if (strcmp(path, "/") == 0) {
@@ -104,19 +119,32 @@ static int fscrypt_fuse_getattr(const char *path, struct stat *st,
 
 static int fscrypt_fuse_readdir(const char *path, void *buf,
                                 fuse_fill_dir_t filler, off_t offset,
+#if FUSE_USE_VERSION >= 30
                                 struct fuse_file_info *fi,
                                 enum fuse_readdir_flags flags)
+#else
+                                struct fuse_file_info* fi)
+#endif
 {
     (void)offset;
     (void)fi;
+#if FUSE_USE_VERSION >= 30
     (void)flags;
+#endif
 
     if (strcmp(path, "/") != 0)
         return -ENOENT;
 
+#if FUSE_USE_VERSION >= 30
     filler(buf, ".",           NULL, 0, 0);
     filler(buf, "..",          NULL, 0, 0);
     filler(buf, get_state()->image_filename, NULL, 0, 0);
+#else
+    filler(buf, ".",           NULL, 0);
+    filler(buf, "..",          NULL, 0);
+    filler(buf, get_state()->image_filename, NULL, 0);
+#endif
+
     return 0;
 }
 
@@ -152,15 +180,22 @@ static int fscrypt_fuse_write(const char *path, const char *buf, size_t size,
     return (int)ret;
 }
 
-static int fscrypt_fuse_truncate(const char *path, off_t size,
+static int fscrypt_fuse_truncate(const char *path,
+#if FUSE_USE_VERSION >= 30
+                                  off_t size,
                                   struct fuse_file_info *fi)
 {
-    if (fi->fh != IMAGE_FILE_HANDLE)
-        return -ENOENT;
+#else
+                                  off_t size)
+{
+    const struct fuse_file_info* fi = nullptr;
+#endif
     if (size < 0)
         return -EINVAL;
+    if ((fi != nullptr && fi->fh == IMAGE_FILE_HANDLE) || (path[0] == '/' && strcmp(path + 1, get_state()->image_filename) == 0))
+        return fscrypt_truncate(get_state(), (uint64_t)size);
 
-    return fscrypt_truncate(get_state(), (uint64_t)size);
+    return -ENOENT;
 }
 
 static int fscrypt_fuse_flush(const char *path, struct fuse_file_info *fi)
