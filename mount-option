@@ -16,11 +16,23 @@ def unmount_images(mountpoint: Path, temp_mount_path: Path, images: list[Path]):
             mountpoint / image.stem,
             temp_mount_path / image.stem,
         ):
-            subprocess.call(["umount", mount])
-            time.sleep(0.5)
+            while True:
+                try:
+                    subprocess.check_call(["umount", mount])
 
-            with contextlib.suppress(FileNotFoundError, OSError):
-                mount.rmdir()
+                    with contextlib.suppress(FileNotFoundError, OSError):
+                        mount.rmdir()
+
+                    break
+                except subprocess.CalledProcessError as e:
+                    if (e.returncode & 32) == 0:
+                        raise
+
+                    if (
+                        isinstance(e.stdout, bytes) and b"target is busy" in e.stdout
+                    ) or (isinstance(e.stdout, str) and "target is busy" in e.stdout):
+                        print(f"{mount} is busy, waiting for 1 second...")
+                        time.sleep(1)
 
     temp_mount_path.rmdir()
 
