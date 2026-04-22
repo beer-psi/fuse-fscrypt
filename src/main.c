@@ -20,6 +20,10 @@
 #   define stat fuse_stat
 #endif
 
+#ifdef __MINGW32__
+#   define blkcnt_t long int
+#endif
+
 #define IMAGE_FILE_HANDLE 1
 
 struct cli_options {
@@ -106,9 +110,9 @@ static int fscrypt_fuse_getattr(const char *path,
         st->st_blocks  = (blkcnt_t)((img_sz + 511u) / 512u);
 
         time_t now = time(NULL);
-        st->st_atime = now;
-        st->st_mtime = s->image_timestamp;
-        st->st_ctime = s->image_timestamp;
+        st->st_atim.tv_sec = now;
+        st->st_mtim.tv_sec = s->image_timestamp;
+        st->st_ctim.tv_sec = s->image_timestamp;
         return 0;
     }
 
