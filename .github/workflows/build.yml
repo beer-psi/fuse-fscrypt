@@ -34,7 +34,7 @@ jobs:
           path-type: "inherit"
           msystem: "MINGW64"
           update: true
-          install: "mingw-w64-x86_64-gcc mingw-w64-x86_64-make"
+          install: "mingw-w64-x86_64-gcc mingw-w64-x86_64-ninja mingw-w64-x86_64-pkg-config mingw-w64-x86_64-openssl mingw-w64-x86_64-zlib"
 
       - run: "choco install -y winfsp"
         if: "matrix.os == 'windows-latest'"
@@ -57,7 +57,7 @@ jobs:
       - run: "meson setup --buildtype release build"
         if: "matrix.os != 'windows-latest'"
         env:
-          CC: "gcc-15"
+          CC: "gcc-14"
 
       - run: "meson compile -C build -v"
 
