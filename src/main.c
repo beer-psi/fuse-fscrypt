@@ -1,9 +1,7 @@
 #if FUSE_USE_VERSION >= 30
 #include <fuse3/fuse.h>
-#include <fuse3/fuse_opt.h>
 #else
-#include <fuse/fuse.h>
-#include <fuse/fuse_opt.h>
+#include <fuse.h>
 #endif
 
 #include <errno.h> // IWYU pragma: keep
