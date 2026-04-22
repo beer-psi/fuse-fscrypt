@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include <pthread.h>
 
@@ -51,7 +52,7 @@ extern const size_t  FSCRYPT_HMAC_KEY_LEN;
 
 struct fscrypt_state {
     /** Open file descriptor for the container (O_RDWR). */
-    int fd;
+    FILE* fp;
 
     /** Decrypted and parsed BootID read from the container on mount. */
     struct BootID bootid;

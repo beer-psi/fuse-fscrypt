@@ -3,17 +3,21 @@
 #include "src/cache.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <openssl/evp.h>
 #include <zlib.h>
+
+#ifdef __MINGW32__
+#   define fseek fseeko64
+#else
+#   include <unistd.h>
+#endif
 
 #define IS_APM3(id) ((id)[0] == 'S' && (id)[1] == 'D' && (id)[2] == 'E' && (id)[3] == 'M')
 
@@ -85,13 +89,38 @@ static inline off_t img_to_cont(const struct fscrypt_state *s, off_t img_off)
  * callers always receive a fully populated buffer.
  * Returns 0 on success, negative errno on I/O error.
  */
-static int read_exact(int fd, void *buf, size_t len, off_t off)
+static int read_exact(FILE* fp, void *buf, size_t len, off_t off)
 {
-    ssize_t n = pread(fd, buf, len, off);
-    if (n < 0)
+    if (fseek(fp, off, SEEK_SET) != 0) {
         return -errno;
-    if ((size_t)n < len)
-        memset((char *)buf + n, 0, len - (size_t)n);
+    }
+
+    size_t n = fread(buf, 1, len, fp);
+    int error = ferror(fp);
+
+    if (error != 0) {
+        return -error;
+    }
+
+    if (n < len) {
+        memset((uint8_t *)buf + n, 0, len - n);
+    }
+
+    return 0;
+}
+
+static int write_exact(FILE* fp, void* buf, size_t len, off_t off)
+{
+    if (fseek(fp, off, SEEK_SET) != 0) {
+        return -errno;
+    }
+
+    size_t n = fwrite(buf, 1, len, fp);
+
+    if (n != len) {
+        return errno != 0 ? -errno : -EIO;
+    }
+
     return 0;
 }
 
@@ -116,7 +145,8 @@ static int update_block_crc32(struct fscrypt_state *s, uint64_t block_num)
     if (!buf)
         return -ENOMEM;
 
-    int ret = read_exact(s->fd, buf, block_size, block_start(s, block_num));
+    int ret = read_exact(s->fp, buf, block_size, block_start(s, block_num));
+
     if (ret != 0) {
         free(buf);
         return ret;
@@ -126,11 +156,9 @@ static int update_block_crc32(struct fscrypt_state *s, uint64_t block_num)
     free(buf);
 
     off_t   crc_off = (off_t)FSCRYPT_CRC32_OFFSET + (off_t)(block_num * 4u);
-    ssize_t n = pwrite(s->fd, &crc, sizeof crc, crc_off);
-    if (n != (ssize_t)sizeof crc)
-        return (n < 0) ? -errno : -EIO;
+    ret = write_exact(s->fp, &crc, sizeof(crc), crc_off);
 
-    return 0;
+    return ret;
 }
 
 /*  fscrypt_open_container  */
@@ -152,15 +180,16 @@ int fscrypt_open_container(const char    *path,
 
     int ret = 0;
 
-    s->fd = open(path, O_RDWR);
-    if (s->fd < 0) {
+    s->fp = fopen(path, "r+b");
+
+    if (s->fp == nullptr) {
         ret = -errno;
         goto err_free;
     }
 
     /*  Read and decrypt the BootID area  */
     uint8_t enc_boot[FSCRYPT_BOOT_SIZE];
-    ret = read_exact(s->fd, enc_boot, FSCRYPT_BOOT_SIZE, 0);
+    ret = read_exact(s->fp, enc_boot, FSCRYPT_BOOT_SIZE, 0);
     if (ret != 0)
         goto err_close;
 
@@ -255,7 +284,7 @@ int fscrypt_open_container(const char    *path,
                 }
             } else {
                 uint8_t derived_apm3_key[16], derived_apm3_iv[16], encrypted_header[16], decrypted_header[16];
-                ret = read_exact(s->fd, encrypted_header, sizeof(encrypted_header), s->bootid.header_block_count * s->bootid.block_size);
+                ret = read_exact(s->fp, encrypted_header, sizeof(encrypted_header), s->bootid.header_block_count * s->bootid.block_size);
 
                 if (ret != 0) {
                     goto err_close;
@@ -348,7 +377,7 @@ int fscrypt_open_container(const char    *path,
             expected_header = NTFS_HEADER;
         }
 
-        ret = read_exact(s->fd, encrypted_header, sizeof(encrypted_header), s->bootid.header_block_count * s->bootid.block_size);
+        ret = read_exact(s->fp, encrypted_header, sizeof(encrypted_header), s->bootid.header_block_count * s->bootid.block_size);
 
         if (ret != 0) {
             goto err_close;
@@ -415,8 +444,10 @@ int fscrypt_open_container(const char    *path,
         .tm_mday = s->bootid.timestamp.day,
         .tm_mon = s->bootid.timestamp.month - 1,
         .tm_year = s->bootid.timestamp.year - 1900,
+#ifdef __USE_MISC
         .tm_gmtoff = 9 * 3600,
         .tm_zone = "Asia/Tokyo",
+#endif
     };
     s->image_timestamp = mktime(&bootid_tm);
 
@@ -430,7 +461,7 @@ int fscrypt_open_container(const char    *path,
     return 0;
 
 err_close:
-    close(s->fd);
+    fclose(s->fp);
 err_free:
     free(s);
     return ret;
@@ -442,7 +473,7 @@ void fscrypt_close_container(struct fscrypt_state *s)
         return;
     fscrypt_flush_headers(s);
     pthread_mutex_destroy(&s->lock);
-    close(s->fd);
+    fclose(s->fp);
     EVP_CIPHER_CTX_free(s->encrypt_ctx);
     EVP_CIPHER_CTX_free(s->decrypt_ctx);
     free(s);
@@ -494,7 +525,7 @@ ssize_t fscrypt_read(struct fscrypt_state *s,
             off_t cont_off = img_to_cont(s, (off_t)page_img_base);
 
             /* Read one encrypted page; zero-pad if the file is shorter. */
-            ret = read_exact(s->fd, enc, FSCRYPT_PAGE_SIZE, cont_off);
+            ret = read_exact(s->fp, enc, FSCRYPT_PAGE_SIZE, cont_off);
 
             if (ret != 0)
                 break;
@@ -587,7 +618,7 @@ ssize_t fscrypt_write(struct fscrypt_state *s,
          */
         if (page_off != 0 || copy < FSCRYPT_PAGE_SIZE) {
             uint8_t enc_old[FSCRYPT_PAGE_SIZE];
-            int rd = read_exact(s->fd, enc_old, FSCRYPT_PAGE_SIZE, cont_off);
+            int rd = read_exact(s->fp, enc_old, FSCRYPT_PAGE_SIZE, cont_off);
             if (rd != 0) { ret = rd; break; }
 
             derive_page_iv(s->file_iv, page_img_base, page_iv);
@@ -630,10 +661,15 @@ ssize_t fscrypt_write(struct fscrypt_state *s,
             break;
         }
 
-        ssize_t n = pwrite(s->fd, enc_new, FSCRYPT_PAGE_SIZE, cont_off);
+        if (fseek(s->fp, cont_off, SEEK_SET) != 0) {
+            ret = -errno;
+            break;
+        }
 
-        if (n != (ssize_t)FSCRYPT_PAGE_SIZE) {
-            ret = (n < 0) ? -errno : -EIO;
+        size_t n = fwrite(enc_new, sizeof(enc_new[0]), FSCRYPT_PAGE_SIZE, s->fp);
+
+        if (n != FSCRYPT_PAGE_SIZE) {
+            ret = errno != 0 ? -errno : -EIO;
             break;
         }
 
@@ -686,7 +722,11 @@ int fscrypt_truncate(struct fscrypt_state *s, uint64_t new_size)
     uint64_t data_blocks = (new_size + block_size - 1) / block_size;
     uint64_t new_bc      = data_blocks + header_blocks;
 
-    if (ftruncate(s->fd, (off_t)(new_bc * block_size)) != 0) {
+#ifdef __MINGW32__
+    if (_chsize_s(_fileno(s->fp), (__int64)(new_bc * block_size)) != 0) {
+#else
+    if (ftruncate(fileno(s->fp), (off_t)(new_bc * block_size)) != 0) {
+#endif
         int ret = -errno;
         pthread_mutex_unlock(&s->lock);
         return ret;
@@ -734,9 +774,10 @@ int fscrypt_flush_headers(struct fscrypt_state *s)
         ret = -EIO;
         goto done;
     }
-    if (pwrite(s->fd, enc_boot, FSCRYPT_BOOT_SIZE, 0)
-            != (ssize_t)FSCRYPT_BOOT_SIZE) {
-        ret = -errno;
+
+    ret = write_exact(s->fp, enc_boot, FSCRYPT_BOOT_SIZE, 0);
+
+    if (ret != 0) {
         goto done;
     }
 
@@ -755,15 +796,16 @@ int fscrypt_flush_headers(struct fscrypt_state *s)
         uint8_t *blk = malloc(block_size);
         if (!blk) { ret = -ENOMEM; goto done; }
 
-        ret = read_exact(s->fd, blk, block_size, block_start(s, m));
+        ret = read_exact(s->fp, blk, block_size, block_start(s, m));
         if (ret != 0) { free(blk); goto done; }
 
         uint32_t crc = crc32_z(0, blk, block_size);
         free(blk);
 
         off_t crc_off = (off_t)FSCRYPT_CRC32_OFFSET + (off_t)(m * 4u);
-        if (pwrite(s->fd, &crc, sizeof crc, crc_off) != (ssize_t)sizeof crc) {
-            ret = -errno;
+        ret = write_exact(s->fp, &crc, sizeof(crc), crc_off);
+
+        if (ret != 0) {
             goto done;
         }
     }
@@ -788,7 +830,7 @@ int fscrypt_flush_headers(struct fscrypt_state *s)
         uint8_t *blk0 = malloc(block_size);
         if (!blk0) { ret = -ENOMEM; goto done; }
 
-        ret = read_exact(s->fd, blk0, block_size, 0);
+        ret = read_exact(s->fp, blk0, block_size, 0);
         if (ret != 0) { free(blk0); goto done; }
 
         uint32_t crc0 = crc32_z(0, blk0, FSCRYPT_BOOT_SIZE);
@@ -797,9 +839,9 @@ int fscrypt_flush_headers(struct fscrypt_state *s)
                           block_size - FSCRYPT_BOOT_SIZE - FSCRYPT_CRC32_SKIP);
         free(blk0);
 
-        if (pwrite(s->fd, &crc0, sizeof crc0, (off_t)FSCRYPT_CRC32_OFFSET)
-                != (ssize_t)sizeof crc0) {
-            ret = -errno;
+        ret = write_exact(s->fp, &crc0, sizeof(crc0), (off_t)FSCRYPT_CRC32_OFFSET);
+
+        if (ret != 0) {
             goto done;
         }
     }
@@ -818,7 +860,7 @@ int fscrypt_flush_headers(struct fscrypt_state *s)
         uint8_t *hmac_data = malloc(hmac_data_len);
         if (!hmac_data) { ret = -ENOMEM; goto done; }
 
-        ret = read_exact(s->fd, hmac_data, hmac_data_len,
+        ret = read_exact(s->fp, hmac_data, hmac_data_len,
                          (off_t)FSCRYPT_CRC32_OFFSET);
         if (ret != 0) { free(hmac_data); goto done; }
 
@@ -828,9 +870,9 @@ int fscrypt_flush_headers(struct fscrypt_state *s)
         free(hmac_data);
         if (hr != 0) { ret = -EIO; goto done; }
 
-        if (pwrite(s->fd, hmac, FSCRYPT_HMAC_SIZE, (off_t)FSCRYPT_HMAC_OFFSET)
-                != (ssize_t)FSCRYPT_HMAC_SIZE) {
-            ret = -errno;
+        ret = write_exact(s->fp, hmac, FSCRYPT_HMAC_SIZE, (off_t)FSCRYPT_HMAC_OFFSET);
+
+        if (ret != 0) {
             goto done;
         }
     }
