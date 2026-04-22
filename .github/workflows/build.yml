@@ -49,9 +49,15 @@ jobs:
         with:
           python-version: "3.x"
 
-      - run: "pip install meson ninja jsonschema jinja2"
+      - run: "pip install meson ninja"
 
       - run: "meson setup --buildtype release build"
+        if: "matrix.os == 'windows-latest'"
+
+      - run: "meson setup --buildtype release build"
+        if: "matrix.os != 'windows-latest'"
+        env:
+          CC: "gcc-15"
 
       - run: "meson compile -C build -v"
 
